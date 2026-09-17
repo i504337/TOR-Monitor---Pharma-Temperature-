@@ -1,0 +1,22 @@
+apiVersion: asset.sap/v1
+kind: Asset
+
+metadata:
+  name: n8n
+  version: "1.0.0"
+
+type: n8n-workflow
+sourceRoot: "workflows"
+
+requires:
+  - name: tor-advisory-agent
+    kind: agent
+    ordId: customer.build:agent:tor-monitor-1fdde.tor-advisory-agent:v1
+
+provides:
+  protocols:
+    - http
+  workflows:
+    - definitionFile: tor-monitoring-workflow.n8n.json
+      name: tor-monitoring-workflow
+      ordId: customer.build:apiResource:tor-monitor-1fdde.tor-monitoring-workflow:v1

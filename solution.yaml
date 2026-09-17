@@ -1,0 +1,11 @@
+apiVersion: solution.sap/v1
+kind: Solution
+
+metadata:
+  name: tor-monitor-1fdde
+  version: "1.0.0"
+  description: "Automated Time Out of Refrigerator (TOR) monitoring, alerting, and stock compliance enforcement for pharmaceutical materials"
+
+assets:
+  - ref: ./assets/n8n/asset.yaml
+  - ref: ./assets/tor-advisory-agent/asset.yaml

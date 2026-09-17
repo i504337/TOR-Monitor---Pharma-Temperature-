@@ -1,0 +1,516 @@
+{
+    "name": "TOR Monitoring Workflow",
+    "description": "Automated Time Out of Refrigerator (TOR) monitoring for pharmaceutical materials. Polls SAP S/4HANA EWM for warehouse task confirmations, evaluates TOR thresholds against CAP service records, issues warning alerts (80%) via SAP Agent advisory and breach alerts (100%) with automatic stock blocking, and logs a full audit trail on fridge put-away.",
+    "nodes": [
+        {
+            "id": "node-cron-1",
+            "name": "TOR Polling Schedule",
+            "type": "n8n-nodes-base.cron",
+            "typeVersion": 1,
+            "position": [
+                200,
+                300
+            ],
+            "parameters": {
+                "triggerTimes": {
+                    "item": [
+                        {
+                            "mode": "everyX",
+                            "value": 5,
+                            "unit": "minutes"
+                        }
+                    ]
+                }
+            }
+        },
+        {
+            "id": "node-code-fetch-tasks",
+            "name": "Fetch Confirmed Warehouse Tasks",
+            "type": "n8n-nodes-base.code",
+            "typeVersion": 2,
+            "position": [
+                420,
+                300
+            ],
+            "parameters": {
+                "mode": "runOnceForAllItems",
+                "jsCode": "// Fetch confirmed warehouse tasks from SAP S/4HANA EWM\n// Uses the WAREHOUSEORDER_0001 OData API\n// GET https://your-s4hana.company.com/sap/opu/odata/sap/WAREHOUSEORDER_0001/WarehouseTask?$filter=WarehouseTaskStatus eq 'C'\nconst S4_BASE_URL = 'https://your-s4hana.company.com/sap/opu/odata/sap/WAREHOUSEORDER_0001';\nconst CAP_BASE_URL = 'https://your-cap-service.company.com';\nreturn [{ json: { triggerTime: new Date().toISOString(), s4BaseUrl: S4_BASE_URL, capBaseUrl: CAP_BASE_URL } }];"
+            }
+        },
+        {
+            "id": "node-code-fetch-active-timers",
+            "name": "Fetch Active TOR Timers",
+            "type": "n8n-nodes-base.code",
+            "typeVersion": 2,
+            "position": [
+                640,
+                300
+            ],
+            "parameters": {
+                "mode": "runOnceForAllItems",
+                "jsCode": "// Fetch all ACTIVE TOR timer records from CAP service\n// GET https://your-cap-service.company.com/TOREvents?$filter=status eq 'ACTIVE'\n// Response shape: [{ batchId, materialId, fridgeOutTimestamp, torLimitMinutes, warningAlertSentAt, breachAlertSentAt, status }]\nconst items = $input.all().map(item => ({ json: { ...item.json, activeTimers: [] } }));\nreturn items;"
+            }
+        },
+        {
+            "id": "node-code-evaluate-thresholds",
+            "name": "Evaluate TOR Thresholds",
+            "type": "n8n-nodes-base.code",
+            "typeVersion": 2,
+            "position": [
+                860,
+                300
+            ],
+            "parameters": {
+                "mode": "runOnceForAllItems",
+                "jsCode": "// Evaluate elapsed TOR time for each active batch against warning and breach thresholds\nconst TOR_WARNING_PERCENT = 0.8;\nconst TOR_BREACH_PERCENT = 1.0;\n\nconst now = new Date();\nconst results = [];\nconst timers = $input.first().json.activeTimers || [];\n\nfor (const timer of timers) {\n  const fridgeOut = new Date(timer.fridgeOutTimestamp);\n  const elapsedMinutes = (now - fridgeOut) / 60000;\n  const torLimitMinutes = timer.torLimitMinutes;\n  const remainingMinutes = torLimitMinutes - elapsedMinutes;\n  const elapsedPercent = elapsedMinutes / torLimitMinutes;\n\n  let alertLevel = 'NONE';\n  if (elapsedPercent >= TOR_BREACH_PERCENT && !timer.breachAlertSentAt) {\n    alertLevel = 'BREACH';\n  } else if (elapsedPercent >= TOR_WARNING_PERCENT && !timer.warningAlertSentAt) {\n    alertLevel = 'WARNING';\n  } else if (timer.status === 'COMPLETED_FRIDGE_IN') {\n    alertLevel = 'PUTAWAY';\n  }\n\n  results.push({\n    json: {\n      ...timer,\n      elapsedMinutes: Math.round(elapsedMinutes * 10) / 10,\n      remainingMinutes: Math.round(remainingMinutes * 10) / 10,\n      elapsedPercent: Math.round(elapsedPercent * 1000) / 1000,\n      alertLevel\n    }\n  });\n}\n\nif (results.length === 0) {\n  return [{ json: { alertLevel: 'NONE', message: 'No active TOR timers requiring action' } }];\n}\n\nreturn results;"
+            }
+        },
+        {
+            "id": "node-switch-alert",
+            "name": "Route by Alert Level",
+            "type": "n8n-nodes-base.switch",
+            "typeVersion": 3.2,
+            "position": [
+                1080,
+                300
+            ],
+            "parameters": {
+                "mode": "rules",
+                "rules": {
+                    "values": [
+                        {
+                            "conditions": {
+                                "options": {
+                                    "caseSensitive": true,
+                                    "leftValue": "",
+                                    "typeValidation": "strict"
+                                },
+                                "conditions": [
+                                    {
+                                        "leftValue": "={{ $json.alertLevel }}",
+                                        "rightValue": "WARNING",
+                                        "operator": {
+                                            "type": "string",
+                                            "operation": "equals"
+                                        }
+                                    }
+                                ],
+                                "combinator": "and"
+                            },
+                            "renameOutput": true,
+                            "outputKey": "warning"
+                        },
+                        {
+                            "conditions": {
+                                "options": {
+                                    "caseSensitive": true,
+                                    "leftValue": "",
+                                    "typeValidation": "strict"
+                                },
+                                "conditions": [
+                                    {
+                                        "leftValue": "={{ $json.alertLevel }}",
+                                        "rightValue": "BREACH",
+                                        "operator": {
+                                            "type": "string",
+                                            "operation": "equals"
+                                        }
+                                    }
+                                ],
+                                "combinator": "and"
+                            },
+                            "renameOutput": true,
+                            "outputKey": "breach"
+                        },
+                        {
+                            "conditions": {
+                                "options": {
+                                    "caseSensitive": true,
+                                    "leftValue": "",
+                                    "typeValidation": "strict"
+                                },
+                                "conditions": [
+                                    {
+                                        "leftValue": "={{ $json.alertLevel }}",
+                                        "rightValue": "PUTAWAY",
+                                        "operator": {
+                                            "type": "string",
+                                            "operation": "equals"
+                                        }
+                                    }
+                                ],
+                                "combinator": "and"
+                            },
+                            "renameOutput": true,
+                            "outputKey": "putaway"
+                        }
+                    ]
+                },
+                "options": {
+                    "fallbackOutput": "extra",
+                    "renameFallbackOutput": "no-action"
+                }
+            }
+        },
+        {
+            "id": "node-agent-warning",
+            "name": "TOR Warning Advisory Agent",
+            "type": "CUSTOM.sapAgent",
+            "typeVersion": 1,
+            "position": [
+                1300,
+                100
+            ],
+            "parameters": {
+                "agents": "[{\"ordId\":\"customer.build:agent:tor-monitor-1fdde.tor-advisory-agent:v1\",\"name\":\"TOR Advisory Agent\"}]",
+                "agentName": "{\"ordId\":\"customer.build:agent:tor-monitor-1fdde.tor-advisory-agent:v1\",\"name\":\"TOR Advisory Agent\"}",
+                "input": "={{ 'Batch ' + $json.batchId + ' for material ' + $json.materialId + ' has reached ' + ($json.elapsedPercent * 100).toFixed(0) + '% of its TOR limit. Elapsed: ' + $json.elapsedMinutes + ' min, TOR limit: ' + $json.torLimitMinutes + ' min, remaining: ' + $json.remainingMinutes + ' min. Provide an EXPEDITE or HOLD recommendation with urgency level and brief reasoning.' }}",
+                "sessionId": "={{ $json.batchId }}"
+            }
+        },
+        {
+            "id": "node-if-agent-success",
+            "name": "Agent Response Received",
+            "type": "n8n-nodes-base.if",
+            "typeVersion": 2,
+            "position": [
+                1520,
+                100
+            ],
+            "parameters": {
+                "conditions": {
+                    "options": {
+                        "caseSensitive": true,
+                        "leftValue": "",
+                        "typeValidation": "loose"
+                    },
+                    "conditions": [
+                        {
+                            "leftValue": "={{ $json.response }}",
+                            "rightValue": "",
+                            "operator": {
+                                "type": "string",
+                                "operation": "notEmpty"
+                            }
+                        }
+                    ],
+                    "combinator": "and"
+                }
+            }
+        },
+        {
+            "id": "node-code-warning-notification",
+            "name": "Send Warning Notification",
+            "type": "n8n-nodes-base.code",
+            "typeVersion": 2,
+            "position": [
+                1740,
+                60
+            ],
+            "parameters": {
+                "mode": "runOnceForAllItems",
+                "jsCode": "// NOTIFICATION ROUTING CONFIGURATION\n// Warning alerts go to Warehouse Manager + Shopfloor Manager ONLY\nconst NOTIFICATION_CONFIG = {\n  WAREHOUSE_MANAGER_EMAIL: 'warehouse.manager@company.com',\n  SHOPFLOOR_MANAGER_EMAIL: 'shopfloor.manager@company.com',\n  NOTIFICATION_SUBJECT_PREFIX: '[TOR WARNING]'\n};\n\nconst batchData = $input.first().json;\nconst agentRecommendation = batchData.response || 'Advisory unavailable';\n\nconst logEntry = `M2.achieved: warning alert issued for batch ${batchData.batchId}, elapsed ${batchData.elapsedMinutes} min of ${batchData.torLimitMinutes} min, AI recommendation: ${agentRecommendation}`;\nconsole.log(logEntry);\n\nreturn [{\n  json: {\n    ...batchData,\n    notification: {\n      recipients: [NOTIFICATION_CONFIG.WAREHOUSE_MANAGER_EMAIL, NOTIFICATION_CONFIG.SHOPFLOOR_MANAGER_EMAIL],\n      subject: `${NOTIFICATION_CONFIG.NOTIFICATION_SUBJECT_PREFIX} Batch ${batchData.batchId} approaching TOR limit`,\n      body: `TOR WARNING ALERT\\nBatch: ${batchData.batchId}\\nMaterial: ${batchData.materialId}\\nElapsed: ${batchData.elapsedMinutes} min of ${batchData.torLimitMinutes} min (${(batchData.elapsedPercent*100).toFixed(0)}%)\\nRemaining: ${batchData.remainingMinutes} min\\n\\nAdvisory: ${agentRecommendation}`\n    },\n    agentRecommendation\n  }\n}];"
+            }
+        },
+        {
+            "id": "node-code-warning-no-recommendation",
+            "name": "Warning Without Recommendation",
+            "type": "n8n-nodes-base.code",
+            "typeVersion": 2,
+            "position": [
+                1740,
+                160
+            ],
+            "parameters": {
+                "mode": "runOnceForAllItems",
+                "jsCode": "// Agent timed out or returned empty — send warning without AI recommendation\nconst NOTIFICATION_CONFIG = {\n  WAREHOUSE_MANAGER_EMAIL: 'warehouse.manager@company.com',\n  SHOPFLOOR_MANAGER_EMAIL: 'shopfloor.manager@company.com'\n};\n\nconst item = $input.first().json;\nconsole.log(`M2.missed: advisory agent failed for batch ${item.batchId} — sending warning without recommendation`);\n\nreturn [{\n  json: {\n    ...item,\n    notification: {\n      recipients: [NOTIFICATION_CONFIG.WAREHOUSE_MANAGER_EMAIL, NOTIFICATION_CONFIG.SHOPFLOOR_MANAGER_EMAIL],\n      subject: `[TOR WARNING] Batch ${item.batchId} — Advisory Unavailable`,\n      body: `TOR WARNING: Batch ${item.batchId} at ${(item.elapsedPercent*100).toFixed(0)}% of TOR limit. Remaining: ${item.remainingMinutes} min. Advisory agent unavailable — please assess manually.`\n    },\n    agentRecommendation: 'Unavailable'\n  }\n}];"
+            }
+        },
+        {
+            "id": "node-merge-warning-paths",
+            "name": "Merge Warning Paths",
+            "type": "n8n-nodes-base.merge",
+            "typeVersion": 3,
+            "position": [
+                1960,
+                100
+            ],
+            "parameters": {
+                "mode": "append",
+                "numberInputs": 2
+            }
+        },
+        {
+            "id": "node-code-update-warning-record",
+            "name": "Update CAP Warning Record",
+            "type": "n8n-nodes-base.code",
+            "typeVersion": 2,
+            "position": [
+                2180,
+                100
+            ],
+            "parameters": {
+                "mode": "runOnceForAllItems",
+                "jsCode": "// Update TOR event record in CAP service after warning\n// PATCH https://your-cap-service.company.com/TOREvents/{id}\n// Set: warningAlertSentAt, aiRecommendation, status remains 'ACTIVE'\nconst item = $input.first().json;\nconsole.log(`CAP warning record updated for batch ${item.batchId}`);\nreturn [{ json: { ...item, warningRecordUpdated: true, warningAlertSentAt: new Date().toISOString() } }];"
+            }
+        },
+        {
+            "id": "node-code-get-physical-stock",
+            "name": "Get Physical Stock Record",
+            "type": "n8n-nodes-base.code",
+            "typeVersion": 2,
+            "position": [
+                1300,
+                400
+            ],
+            "parameters": {
+                "mode": "runOnceForAllItems",
+                "jsCode": "// Look up physical stock record from SAP S/4HANA EWM\n// GET https://your-s4hana.company.com/sap/opu/odata/sap/CE_WHSEPHYSICALSTOCKPRODUCTS_0001/WarehousePhysicalStockProducts?$filter=Batch eq '{batchId}'\nconst item = $input.first().json;\nreturn [{ json: { ...item, stockRecordFetched: true } }];"
+            }
+        },
+        {
+            "id": "node-code-block-stock",
+            "name": "Block Stock in S/4HANA",
+            "type": "n8n-nodes-base.code",
+            "typeVersion": 2,
+            "position": [
+                1520,
+                400
+            ],
+            "parameters": {
+                "mode": "runOnceForAllItems",
+                "jsCode": "// Change stock type to BLOCKED via ChangeStockType OData action\n// POST https://your-s4hana.company.com/sap/opu/odata/sap/CE_WHSEPHYSICALSTOCKPRODUCTS_0001/WarehousePhysicalStockProducts({key})/ChangeStockType\n// Body: { EWMStockType: 'S2', EWMGoodsMovementEntryUnit: 'EA', EWMGoodsMovementEntryQuantity: 1 }\n// S2 = EWM blocked stock type (unrestricted-use → blocked)\nconst item = $input.first().json;\nconsole.log(`M3.achieved: TOR breach confirmed for batch ${item.batchId}, stock blocked in S/4HANA, breach notifications sent to all roles`);\nreturn [{ json: { ...item, stockBlocked: true, stockBlockedAt: new Date().toISOString() } }];"
+            }
+        },
+        {
+            "id": "node-code-breach-notification",
+            "name": "Send Breach Notification",
+            "type": "n8n-nodes-base.code",
+            "typeVersion": 2,
+            "position": [
+                1740,
+                400
+            ],
+            "parameters": {
+                "mode": "runOnceForAllItems",
+                "jsCode": "// NOTIFICATION ROUTING CONFIGURATION\n// Breach alerts go to ALL THREE roles\nconst NOTIFICATION_CONFIG = {\n  WAREHOUSE_MANAGER_EMAIL: 'warehouse.manager@company.com',\n  SHOPFLOOR_MANAGER_EMAIL: 'shopfloor.manager@company.com',\n  QUALITY_MANAGER_EMAIL: 'quality.manager@company.com',\n  NOTIFICATION_SUBJECT_PREFIX: '[TOR BREACH]'\n};\n\nconst item = $input.first().json;\nconst stockStatus = item.stockBlocked ? 'BLOCKED in S/4HANA' : 'BLOCK FAILED — manual intervention required';\n\nconst logEntry = item.stockBlocked\n  ? `M3.achieved: TOR breach confirmed for batch ${item.batchId}, stock blocked in S/4HANA, breach notifications sent to all roles`\n  : `M3.missed: TOR breach detected for batch ${item.batchId} but stock block action failed; manual intervention required`;\nconsole.log(logEntry);\n\nreturn [{\n  json: {\n    ...item,\n    breachNotification: {\n      recipients: [\n        NOTIFICATION_CONFIG.WAREHOUSE_MANAGER_EMAIL,\n        NOTIFICATION_CONFIG.SHOPFLOOR_MANAGER_EMAIL,\n        NOTIFICATION_CONFIG.QUALITY_MANAGER_EMAIL\n      ],\n      subject: `${NOTIFICATION_CONFIG.NOTIFICATION_SUBJECT_PREFIX} Batch ${item.batchId} TOR EXCEEDED`,\n      body: `TOR BREACH — IMMEDIATE ACTION REQUIRED\\nBatch: ${item.batchId}\\nMaterial: ${item.materialId}\\nElapsed: ${item.elapsedMinutes} min (limit: ${item.torLimitMinutes} min)\\nStock Status: ${stockStatus}\\n\\nWarehouse Manager: Transfer to scrap bin immediately.\\nShopfloor Manager: Do NOT use this batch in production.\\nQuality Manager: Initiate deviation report per site SOP.`\n    }\n  }\n}];"
+            }
+        },
+        {
+            "id": "node-code-update-breach-record",
+            "name": "Update CAP Breach Record",
+            "type": "n8n-nodes-base.code",
+            "typeVersion": 2,
+            "position": [
+                1960,
+                400
+            ],
+            "parameters": {
+                "mode": "runOnceForAllItems",
+                "jsCode": "// Update TOR event record in CAP service after breach\n// PATCH https://your-cap-service.company.com/TOREvents/{id}\n// Set: breachAlertSentAt, stockBlockedAt, status = 'BREACHED'\nconst item = $input.first().json;\nreturn [{ json: { ...item, breachRecordUpdated: true, status: 'BREACHED', breachAlertSentAt: new Date().toISOString() } }];"
+            }
+        },
+        {
+            "id": "node-code-write-audit-log",
+            "name": "Write Audit Log on Put-Away",
+            "type": "n8n-nodes-base.code",
+            "typeVersion": 2,
+            "position": [
+                1300,
+                560
+            ],
+            "parameters": {
+                "mode": "runOnceForAllItems",
+                "jsCode": "// TOR timer stopped — batch confirmed put-away in destination fridge on PSA\n// Write complete, immutable audit record to CAP service (GxP compliance)\n// PATCH https://your-cap-service.company.com/TOREvents/{id}\n// Set: fridgeInTimestamp, totalExposureMinutes, status = 'COMPLETED'\nconst item = $input.first().json;\nconst now = new Date();\nconst fridgeOut = new Date(item.fridgeOutTimestamp || now);\nconst totalMinutes = Math.round((now - fridgeOut) / 60000 * 10) / 10;\n\nconsole.log(`M4.achieved: TOR timer stopped for batch ${item.batchId}, total exposure ${totalMinutes} min, full audit record written`);\n\nreturn [{\n  json: {\n    batchId: item.batchId,\n    materialId: item.materialId,\n    fridgeOutTimestamp: item.fridgeOutTimestamp,\n    fridgeInTimestamp: now.toISOString(),\n    totalExposureMinutes: totalMinutes,\n    torLimitMinutes: item.torLimitMinutes,\n    warningAlertSentAt: item.warningAlertSentAt || null,\n    breachAlertSentAt: item.breachAlertSentAt || null,\n    status: 'COMPLETED',\n    actionTaken: item.stockBlocked\n      ? 'STOCK_BLOCKED'\n      : (item.breachAlertSentAt ? 'BREACH_NOTIFIED' : 'WITHIN_LIMIT')\n  }\n}];"
+            }
+        },
+        {
+            "id": "node-noop-no-action",
+            "name": "No Action Required",
+            "type": "n8n-nodes-base.noOp",
+            "typeVersion": 1,
+            "position": [
+                1300,
+                700
+            ],
+            "parameters": {}
+        }
+    ],
+    "connections": {
+        "TOR Polling Schedule": {
+            "main": [
+                [
+                    {
+                        "node": "Fetch Confirmed Warehouse Tasks",
+                        "type": "main",
+                        "index": 0
+                    }
+                ]
+            ]
+        },
+        "Fetch Confirmed Warehouse Tasks": {
+            "main": [
+                [
+                    {
+                        "node": "Fetch Active TOR Timers",
+                        "type": "main",
+                        "index": 0
+                    }
+                ]
+            ]
+        },
+        "Fetch Active TOR Timers": {
+            "main": [
+                [
+                    {
+                        "node": "Evaluate TOR Thresholds",
+                        "type": "main",
+                        "index": 0
+                    }
+                ]
+            ]
+        },
+        "Evaluate TOR Thresholds": {
+            "main": [
+                [
+                    {
+                        "node": "Route by Alert Level",
+                        "type": "main",
+                        "index": 0
+                    }
+                ]
+            ]
+        },
+        "Route by Alert Level": {
+            "main": [
+                [
+                    {
+                        "node": "TOR Warning Advisory Agent",
+                        "type": "main",
+                        "index": 0
+                    }
+                ],
+                [
+                    {
+                        "node": "Get Physical Stock Record",
+                        "type": "main",
+                        "index": 0
+                    }
+                ],
+                [
+                    {
+                        "node": "Write Audit Log on Put-Away",
+                        "type": "main",
+                        "index": 0
+                    }
+                ],
+                [
+                    {
+                        "node": "No Action Required",
+                        "type": "main",
+                        "index": 0
+                    }
+                ]
+            ]
+        },
+        "TOR Warning Advisory Agent": {
+            "main": [
+                [
+                    {
+                        "node": "Agent Response Received",
+                        "type": "main",
+                        "index": 0
+                    }
+                ]
+            ]
+        },
+        "Agent Response Received": {
+            "main": [
+                [
+                    {
+                        "node": "Send Warning Notification",
+                        "type": "main",
+                        "index": 0
+                    }
+                ],
+                [
+                    {
+                        "node": "Warning Without Recommendation",
+                        "type": "main",
+                        "index": 0
+                    }
+                ]
+            ]
+        },
+        "Send Warning Notification": {
+            "main": [
+                [
+                    {
+                        "node": "Merge Warning Paths",
+                        "type": "main",
+                        "index": 0
+                    }
+                ]
+            ]
+        },
+        "Warning Without Recommendation": {
+            "main": [
+                [
+                    {
+                        "node": "Merge Warning Paths",
+                        "type": "main",
+                        "index": 1
+                    }
+                ]
+            ]
+        },
+        "Merge Warning Paths": {
+            "main": [
+                [
+                    {
+                        "node": "Update CAP Warning Record",
+                        "type": "main",
+                        "index": 0
+                    }
+                ]
+            ]
+        },
+        "Get Physical Stock Record": {
+            "main": [
+                [
+                    {
+                        "node": "Block Stock in S/4HANA",
+                        "type": "main",
+                        "index": 0
+                    }
+                ]
+            ]
+        },
+        "Block Stock in S/4HANA": {
+            "main": [
+                [
+                    {
+                        "node": "Send Breach Notification",
+                        "type": "main",
+                        "index": 0
+                    }
+                ]
+            ]
+        },
+        "Send Breach Notification": {
+            "main": [
+                [
+                    {
+                        "node": "Update CAP Breach Record",
+                        "type": "main",
+                        "index": 0
+                    }
+                ]
+            ]
+        }
+    },
+    "settings": {
+        "executionOrder": "v1"
+    },
+    "id": "DFEZ00tFMksaQAbb"
+}
