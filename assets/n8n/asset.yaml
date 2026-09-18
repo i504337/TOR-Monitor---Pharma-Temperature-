@@ -8,11 +8,6 @@ metadata:
 type: n8n-workflow
 sourceRoot: "workflows"
 
-requires:
-  - name: tor-advisory-agent
-    kind: agent
-    ordId: customer.build:agent:tor-monitor-1fdde.tor-advisory-agent:v1
-
 provides:
   protocols:
     - http
